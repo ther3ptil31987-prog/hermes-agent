@@ -92,13 +92,23 @@ class TestClassifyFetchFailure:
 
 
 class TestPrintFetchFailure:
-    def test_prints_diagnosis_and_first_raw_line(self, capsys):
+    def test_prints_diagnosis_and_bounded_raw_stderr(self, capsys):
         update_cmd._print_fetch_failure(RATE_LIMIT_STDERR)
         out = capsys.readouterr().out
         assert "rate limiting" in out
         assert "HTTP 429" in out
-        # raw first stderr line preserved for diagnosability
+        # Every raw line is preserved for diagnosability.
         assert "error: RPC failed" in out
+        assert "fatal: expected flush after ref listing" in out
+
+    def test_limits_raw_stderr_to_fifteen_lines(self, capsys):
+        stderr = "\n".join(f"line {i}" for i in range(20))
+        update_cmd._print_fetch_failure(stderr)
+        out = capsys.readouterr().out
+        assert "  line 0" in out
+        assert "  line 14" in out
+        assert "  line 15" not in out
+        assert "  ... (5 more lines omitted)" in out
 
     def test_empty_stderr_prints_only_diagnosis(self, capsys):
         update_cmd._print_fetch_failure("")
@@ -145,13 +155,16 @@ def test_update_and_upstream_network_calls_disable_terminal_prompts(monkeypatch,
         return subprocess.CompletedProcess(cmd, 0, upstream if "rev-parse" in cmd else "", "")
 
     monkeypatch.setattr(subprocess, "run", run)
+    (tmp_path / ".git").mkdir()  # the fork ff's recovery marker lives there: no marker, no move
     update_cmd._git_run(["git"], ["fetch", "origin", "main"], cwd=tmp_path, network=True, check=True)
     assert update_cmd_git._sync_with_upstream_if_needed(["git"], tmp_path, assume_yes=True)
     from hermes_cli.update_custody import git_subcommand
 
-    # The fork's fast-forward is local (`merge --ff-only upstream/main` after the fetch): no
-    # credential helper ever runs under the checkout lock fd a mutator inherits (R2).
-    network = [(args, kwargs) for args, kwargs in calls if git_subcommand(args) != "rev-parse"]
+    # The fork push runs only after the update is validated (_push_synced_fork), never inside the sync.
+    update_cmd_git._sync_fork_with_upstream(["git"], tmp_path)
+    # The fork's fast-forward is local (`merge --ff-only` after the fetch): no credential helper ever
+    # runs under the checkout lock fd a mutator inherits (R2).
+    network = [(args, kwargs) for args, kwargs in calls if git_subcommand(args) in {"fetch", "pull", "push", "merge"}]
     assert [git_subcommand(args) for args, _ in network] == ["fetch", "fetch", "merge", "push"]
     assert network[2][0][-1] == upstream  # the counted commit, not a name a local branch can shadow
     for args, kwargs in network:
